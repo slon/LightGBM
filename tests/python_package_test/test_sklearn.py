@@ -36,6 +36,15 @@ def multi_logloss(y_true, y_pred):
 
 class TestSklearn(unittest.TestCase):
 
+    def test_numpy(self):
+        a = np.arange(10000).reshape(100,100).astype(float)*2
+        b = np.ones(100).astype(float)*2
+
+        x = a.dot(b)
+        y = a.dot(b)
+
+        self.assertTrue(np.all(x == y))
+
     def test_binary(self):
         X, y = load_breast_cancer(True)
         X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.1, random_state=42)
