@@ -571,6 +571,49 @@ class _InnerPredictor(object):
             raise ValueError("Wrong length for predict results")
         return preds, nrow
 
+def _sample_columns(mats, num_sample_row):
+    ncol = mats[0].shape[1]
+    num_total_row = sum(mat.shape[0] for mat in mats)
+
+    sampled_data = (ctypes.POINTER(ctypes.c_double) * ncol)()
+    sampled_indices = (ctypes.POINTER(ctypes.c_int32) * ncol)()
+
+    sampled_idx = np.arange(num_total_row)
+    np.random.shuffle(sampled_idx)
+    sampled_idx = sampled_idx[:num_sample_row]
+    sampled_idx = np.sort(sampled_idx)
+
+    sizes = np.cumsum([mat.shape[0] for mat in mats[:-1]])
+    offsets = [np.searchsorted(sampled_idx, size) for size in sizes]
+    sampled_idx = np.split(sampled_idx, offsets)
+    sizes = np.concatenate(([0], sizes))
+    for i, size in enumerate(sizes):
+        sampled_idx[i] -= size
+
+    sample_sizes = np.cumsum([len(idx) for idx in sampled_idx[:-1]])
+    sample_sizes = np.concatenate(([0], sample_sizes))
+
+    sampled_data_buffer = [[] for _ in range(ncol)]
+    sampled_indices_buffer = [[] for _ in range(ncol)]
+    num_per_col = np.zeros((ncol,), np.int32)
+    for col_idx in range(ncol):
+        for i, mat in enumerate(mats):
+            sampled_chunk = mat[sampled_idx[i], col_idx]
+            sampled_chunk_mask = np.logical_not(np.logical_or(np.isnan(sampled_chunk), np.abs(sampled_chunk) < 1e-35))
+
+            sampled_data_buffer[col_idx].append(sampled_chunk[sampled_chunk_mask].astype(np.double))
+            sampled_indices_buffer[col_idx].append(
+                np.where(sampled_chunk_mask)[0].astype(np.int32) + sample_sizes[i])
+
+        sampled_data_buffer[col_idx] = np.concatenate(sampled_data_buffer[col_idx])
+        sampled_indices_buffer[col_idx] = np.concatenate(sampled_indices_buffer[col_idx])
+        num_per_col[col_idx] = len(sampled_data_buffer[col_idx])
+
+        sampled_data[col_idx] = sampled_data_buffer[col_idx].ctypes.data_as(ctypes.POINTER(ctypes.c_double))
+        sampled_indices[col_idx] = sampled_indices_buffer[col_idx].ctypes.data_as(ctypes.POINTER(ctypes.c_int32))
+
+    return sampled_data, sampled_data_buffer, sampled_indices, sampled_indices_buffer, num_per_col
+
 
 class Dataset(object):
     """Dataset in LightGBM."""
@@ -712,6 +755,8 @@ class Dataset(object):
             self.__init_from_csc(data, params_str, ref_dataset)
         elif isinstance(data, np.ndarray):
             self.__init_from_np2d(data, params_str, ref_dataset)
+        elif isinstance(data, list) and len(data) > 0 and all(isinstance(x, np.ndarray) for x in data):
+            self.__init_from_list_np2d(data, params_str, ref_dataset, params.get("bin_construct_sample_cnt", 200000))
         else:
             try:
                 csr = scipy.sparse.csr_matrix(data)
@@ -774,6 +819,65 @@ class Dataset(object):
             c_str(params_str),
             ref_dataset,
             ctypes.byref(self.handle)))
+
+    def __init_from_list_np2d(self, mats, params_str, ref_dataset, num_sample_row):
+        """
+        Initialize data from list of 2-D numpy matrices.
+        """
+        ncol = mats[0].shape[1]
+        num_total_row = 0
+        for mat in mats:
+            if len(mat.shape) != 2:
+                raise ValueError('Input numpy.ndarray must be 2 dimensional')
+
+            if mat.shape[1] != ncol:
+                raise ValueError('Input arrays must have same number of columns')
+            num_total_row += mat.shape[0]
+        
+        self.handle = ctypes.c_void_p()
+
+        if ref_dataset is None:
+            num_sample_row = min(num_sample_row, num_total_row)
+            sampled_data, sample_data_buffer, sampled_indices, sample_indices_buffer, num_per_col = _sample_columns(mats, num_sample_row)
+
+            ptr_sampled_data = ctypes.cast(sampled_data, ctypes.POINTER(ctypes.POINTER(ctypes.c_double)))
+            ptr_sampled_indices = ctypes.cast(sampled_indices, ctypes.POINTER(ctypes.POINTER(ctypes.c_int32)))
+            ptr_num_per_col = num_per_col.ctypes.data_as(ctypes.POINTER(ctypes.c_int32))
+
+            _safe_call(_LIB.LGBM_DatasetCreateFromSampledColumn(
+                ptr_sampled_data,
+                ptr_sampled_indices,
+                ctypes.c_int(ncol),
+                ptr_num_per_col,
+                ctypes.c_int(num_sample_row),
+                ctypes.c_int(num_total_row),
+                c_str(params_str),
+                ctypes.byref(self.handle)))
+        else:
+            _safe_call(_LIB.LGBM_DatasetCreateByReference(
+                ref_dataset,
+                ctypes.c_int(num_total_row),
+                ctypes.byref(self.handle)))
+
+        start_row = 0
+        for mat in mats:
+            if mat.dtype == np.float32 or mat.dtype == np.float64:
+                data = np.array(mat.reshape(mat.size), dtype=mat.dtype, copy=False)
+            else:
+                data = np.array(mat.reshape(mat.size), dtype=np.float32)
+
+            ptr_mat, type_ptr_mat, _ = c_float_array(data)
+
+            _safe_call(_LIB.LGBM_DatasetPushRows(
+                self.handle,
+                ptr_mat,
+                ctypes.c_int(type_ptr_mat),
+                ctypes.c_int(mat.shape[0]),
+                ctypes.c_int(mat.shape[1]),
+                ctypes.c_int(start_row)))
+
+            start_row += mat.shape[0]
+
 
     def __init_from_csr(self, csr, params_str, ref_dataset):
         """
